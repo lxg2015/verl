@@ -41,6 +41,7 @@ from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
 from verl.workers.sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManager
 
 from codetiming import Timer
+from verl.utils.fsdp_utils import CPUOffloadPolicy, MixedPrecisionPolicy, fsdp_version, apply_fsdp2
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv('VERL_PPO_LOGGING_LEVEL', 'WARN'))
@@ -184,9 +185,12 @@ class ActorRolloutRefWorker(Worker):
         update_model_config(actor_model_config, override_config_kwargs=override_config_kwargs)
         if self.rank == 0:
             print(f'Model config after override: {actor_model_config}')
-
+        
+        fsdp_strategy = self.config.actor.strategy
+        assert fsdp_strategy in ['fsdp', 'fsdp2'], f'not implement {fsdp_strategy}'
         # NOTE(fix me): tie_word_embedding causes meta_tensor init to hang
-        init_context = get_init_weight_context_manager(use_meta_tensor=not actor_model_config.tie_word_embeddings,
+        use_meta_tensor=not actor_model_config.tie_word_embeddings and fsdp_strategy != 'fsdp2'
+        init_context = get_init_weight_context_manager(use_meta_tensor=use_meta_tensor,
                                                        mesh=self.device_mesh)
 
         with init_context(), warnings.catch_warnings():
@@ -251,18 +255,32 @@ class ActorRolloutRefWorker(Worker):
         # We force reference policy to use CPUOffload to save memory.
         # We force turn off CPUOffload for actor because it causes incorrect results when using grad accumulation
         cpu_offload = None if role == 'actor' else CPUOffload(offload_params=True)
-        actor_module_fsdp = FSDP(
-            actor_module,
-            cpu_offload=cpu_offload,
-            param_init_fn=init_fn,
-            use_orig_params=False,
-            auto_wrap_policy=auto_wrap_policy,
-            device_id=torch.cuda.current_device(),
-            sharding_strategy=sharding_strategy,  # zero3
-            mixed_precision=mixed_precision,
-            sync_module_states=True,
-            device_mesh=self.device_mesh,
-            forward_prefetch=False)
+        if fsdp_strategy == 'fsdp':
+            actor_module_fsdp = FSDP(
+                actor_module,
+                cpu_offload=cpu_offload,
+                param_init_fn=init_fn,
+                use_orig_params=False,
+                auto_wrap_policy=auto_wrap_policy,
+                device_id=torch.cuda.current_device(),
+                sharding_strategy=sharding_strategy,  # zero3
+                mixed_precision=mixed_precision,
+                sync_module_states=True,
+                device_mesh=self.device_mesh,
+                forward_prefetch=False)
+        elif fsdp_strategy == 'fsdp2':
+            assert CPUOffloadPolicy is not None, "PyTorch version >= 2.4 is required for using fully_shard API (FSDP2)"
+            mp_policy = MixedPrecisionPolicy(param_dtype=param_dtype, reduce_dtype=reduce_dtype, cast_forward_inputs=True)
+            cpu_offload = None if role == 'actor' else CPUOffloadPolicy(pin_memory=True)
+            fsdp_kwargs = {
+                "mesh": fsdp_mesh,
+                "mp_policy": mp_policy,
+                "offload_policy": cpu_offload,
+            }
+            apply_fsdp2(actor_module, fsdp_kwargs)
+            actor_module_fsdp = actor_module
+        else:
+            raise NotImplementedError(f'not implement {fsdp_strategy}')
 
         log_gpu_memory_usage('After Actor FSDP init', logger=logger)
 
@@ -401,7 +419,8 @@ class ActorRolloutRefWorker(Worker):
                 role='actor')
 
             # get the original unwrapped module
-            self.actor_module = self.actor_module_fsdp._fsdp_wrapped_module
+            if fsdp_version(self.actor_module_fsdp) == 1:
+                self.actor_module = self.actor_module_fsdp._fsdp_wrapped_module
 
             if self._is_offload_optimizer:
                 offload_fsdp_optimizer(optimizer=self.actor_optimizer)
@@ -554,7 +573,7 @@ class ActorRolloutRefWorker(Worker):
 
         # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
         # unshard the root FSDP module
-        if self.world_size > 1:
+        if self.world_size > 1 and fsdp_version(self.actor.actor_module) == 1:
             self.actor.actor_module._handle.reshard(True)
 
         if self._is_offload_param:
@@ -585,7 +604,7 @@ class ActorRolloutRefWorker(Worker):
 
         # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
         # unshard the root FSDP module
-        if self.world_size > 1:
+        if self.world_size > 1 and fsdp_version(self.ref_policy.actor_module) == 1:
             self.ref_policy.actor_module._handle.reshard(True)
 
         return output
@@ -703,8 +722,8 @@ class CriticWorker(Worker):
         trust_remote_code = False
         critic_model_config = AutoConfig.from_pretrained(local_path, trust_remote_code=trust_remote_code)
         critic_model_config.num_labels = 1
-
-        init_context = get_init_weight_context_manager(use_meta_tensor=not critic_model_config.tie_word_embeddings,
+        use_meta_tensor=not critic_model_config.tie_word_embeddings and config.strategy != 'fsdp2'
+        init_context = get_init_weight_context_manager(use_meta_tensor=use_meta_tensor,
                                                        mesh=self.device_mesh)
 
         with init_context(), warnings.catch_warnings():
@@ -753,17 +772,29 @@ class CriticWorker(Worker):
         sharding_strategy = get_sharding_strategy(fsdp_mesh)
 
         # Note: We force turn off CPUOffload for critic because it causes incorrect results when using grad accumulation
-        critic_module = FSDP(critic_module,
-                             param_init_fn=init_fn,
-                             use_orig_params=False,
-                             auto_wrap_policy=auto_wrap_policy,
-                             device_id=torch.cuda.current_device(),
-                             sharding_strategy=sharding_strategy,
-                             mixed_precision=mixed_precision,
-                             sync_module_states=True,
-                             forward_prefetch=False,
-                             device_mesh=self.device_mesh,
-                             cpu_offload=None)
+        if config.strategy == 'fsdp':
+            critic_module = FSDP(critic_module,
+                                 param_init_fn=init_fn,
+                                 use_orig_params=False,
+                                 auto_wrap_policy=auto_wrap_policy,
+                                 device_id=torch.cuda.current_device(),
+                                 sharding_strategy=sharding_strategy,
+                                 mixed_precision=mixed_precision,
+                                 sync_module_states=True,
+                                 forward_prefetch=False,
+                                 device_mesh=self.device_mesh,
+                                 cpu_offload=None)
+        elif config.strategy == 'fsdp2':
+            assert CPUOffloadPolicy is not None, "PyTorch version >= 2.4 is required for using fully_shard API (FSDP2)"
+            mp_policy = MixedPrecisionPolicy(param_dtype=param_dtype, reduce_dtype=reduce_dtype, cast_forward_inputs=True)
+            fsdp_kwargs = {
+                "mesh": fsdp_mesh,
+                "mp_policy": mp_policy,
+                "offload_policy": None,
+            }            
+            apply_fsdp2(critic_module, fsdp_kwargs)
+        else:
+            raise NotImplementedError(f'Unknown strategy {config.strategy}')
 
         log_gpu_memory_usage('After critic FSDP', logger=None)
 
@@ -972,7 +1003,8 @@ class RewardModelWorker(Worker):
         model_config.num_labels = 1
 
         # note that we have to create model in fp32. Otherwise, the optimizer is in bf16, which is incorrect
-        init_context = get_init_weight_context_manager(use_meta_tensor=not model_config.tie_word_embeddings,
+        use_meta_tensor=not model_config.tie_word_embeddings and config.strategy != 'fsdp2'
+        init_context = get_init_weight_context_manager(use_meta_tensor=use_meta_tensor,
                                                        mesh=self.device_mesh)
 
         with init_context(), warnings.catch_warnings():
@@ -995,18 +1027,29 @@ class RewardModelWorker(Worker):
         fsdp_mesh = self.device_mesh
         sharding_strategy = get_sharding_strategy(fsdp_mesh)
 
-        reward_module = FSDP(
-            reward_module,
-            param_init_fn=init_fn,
-            use_orig_params=False,
-            auto_wrap_policy=auto_wrap_policy,
-            device_id=torch.cuda.current_device(),
-            sharding_strategy=sharding_strategy,  # zero3
-            sync_module_states=True,
-            cpu_offload=CPUOffload(offload_params=True),
-            forward_prefetch=False,
-            device_mesh=self.device_mesh)
+        print(f'reward model --{config.strategy} {config}')
 
+        if config.strategy == 'fsdp':
+            reward_module = FSDP(
+                reward_module,
+                param_init_fn=init_fn,
+                use_orig_params=False,
+                auto_wrap_policy=auto_wrap_policy,
+                device_id=torch.cuda.current_device(),
+                sharding_strategy=sharding_strategy,  # zero3
+                sync_module_states=True,
+                cpu_offload=CPUOffload(offload_params=True),
+                forward_prefetch=False,
+                device_mesh=self.device_mesh)
+        elif config.strategy == 'fsdp2':
+            assert CPUOffloadPolicy is not None, "PyTorch version >= 2.4 is required for using fully_shard API (FSDP2)"
+            fsdp_kwargs = {
+                "mesh": fsdp_mesh,
+                "offload_policy": CPUOffloadPolicy(pin_memory=True),
+            }            
+            apply_fsdp2(reward_module, fsdp_kwargs)
+        else:
+            raise NotImplementedError(f"Unknown strategy: {config.strategy}")
         return reward_module
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)

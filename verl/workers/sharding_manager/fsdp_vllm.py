@@ -27,6 +27,7 @@ from verl.utils.torch_functional import (broadcast_dict_tensor, allgather_dict_t
 from verl.protocol import all_gather_data_proto
 from verl.utils.debug import log_gpu_memory_usage
 from verl.third_party.vllm import vllm_version
+from verl.utils.fsdp_utils import fsdp_version
 
 from .base import BaseShardingManager
 from .patch import patched_ds_v3_load_weights
@@ -50,11 +51,11 @@ class FSDPVLLMShardingManager(BaseShardingManager):
 
         # Full params
         self.full_params = full_params
-        if full_params:
+        if full_params and fsdp_version(self.module) == 1:
             FSDP.set_state_dict_type(self.module,
                                      state_dict_type=StateDictType.FULL_STATE_DICT,
                                      state_dict_config=FullStateDictConfig())
-        else:
+        elif fsdp_version(self.module) == 1:
             FSDP.set_state_dict_type(self.module,
                                      state_dict_type=StateDictType.SHARDED_STATE_DICT,
                                      state_dict_config=ShardedStateDictConfig())
