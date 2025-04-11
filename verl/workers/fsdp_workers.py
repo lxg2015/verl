@@ -41,7 +41,8 @@ from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
 from verl.workers.sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManager
 
 from codetiming import Timer
-from verl.utils.fsdp_utils import CPUOffloadPolicy, MixedPrecisionPolicy, fsdp_version, apply_fsdp2
+from verl.utils.fsdp_utils import CPUOffloadPolicy, MixedPrecisionPolicy, fsdp_version, apply_fsdp2, \
+    fsdp2_load_full_state_dict, prepare_for_cpu_offload
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv('VERL_PPO_LOGGING_LEVEL', 'WARN'))
@@ -276,7 +277,10 @@ class ActorRolloutRefWorker(Worker):
                 "mp_policy": mp_policy,
                 "offload_policy": cpu_offload,
             }
+            full_sd = actor_module.state_dict()
             apply_fsdp2(actor_module, fsdp_kwargs)
+            fsdp2_load_full_state_dict(actor_module, full_sd)
+            prepare_for_cpu_offload(actor_module, cpu_offload)
             actor_module_fsdp = actor_module
         else:
             raise NotImplementedError(f'not implement {fsdp_strategy}')
@@ -791,7 +795,10 @@ class CriticWorker(Worker):
                 "mp_policy": mp_policy,
                 "offload_policy": None,
             }            
+            full_sd = critic_module.state_dict()
             apply_fsdp2(critic_module, fsdp_kwargs)
+            fsdp2_load_full_state_dict(critic_module, full_sd)
+            prepare_for_cpu_offload(critic_module, None)
         else:
             raise NotImplementedError(f'Unknown strategy {config.strategy}')
 
@@ -1039,11 +1046,15 @@ class RewardModelWorker(Worker):
                 device_mesh=self.device_mesh)
         elif config.strategy == 'fsdp2':
             assert CPUOffloadPolicy is not None, "PyTorch version >= 2.4 is required for using fully_shard API (FSDP2)"
+            cpu_offload = CPUOffloadPolicy(pin_memory=True)
             fsdp_kwargs = {
                 "mesh": fsdp_mesh,
-                "offload_policy": CPUOffloadPolicy(pin_memory=True),
+                "offload_policy": cpu_offload,
             }            
+            full_sd = reward_module.state_dict()
             apply_fsdp2(reward_module, fsdp_kwargs)
+            fsdp2_load_full_state_dict(reward_module, full_sd)
+            prepare_for_cpu_offload(reward_module, cpu_offload)
         else:
             raise NotImplementedError(f"Unknown strategy: {config.strategy}")
         return reward_module
